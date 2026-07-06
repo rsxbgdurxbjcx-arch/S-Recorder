@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Rclone 上传后处理模块 / Rclone Upload Post-processing Module
+
+通过 rclone 将录制完成的视频上传至 PikPak 等云盘。
+- 自动从文件名提取主播名（去除 _YYYYMMDD_HHMMSS 后缀）
+- 在远程目录下按主播名创建子文件夹
+- 支持重试机制
+- 上传成功后可选删除本地文件
+- 通过 stdout 协议上报进度和速度
+
+协议 / Protocol:
+  --describe           输出模块元数据 JSON
+  PP_INPUT 环境变量     输入视频文件路径
+  PP_PARAM_* 环境变量   模块参数
+  stdout: OUTPUT:path   成功后输出视频路径
+  stdout: PROGRESS:d/t  进度上报 (total=10000)
+  stdout: STATUS:text   状态文字（含上传速度）
+  stdout: DELETE_INPUT  请求主程序删除输入文件
+"""
+
+import sys
+import os
+import re
+import json
+import subprocess
+import time
+import select
+import fcntl
+
+PROGRESS_SCALE = 10000
+
+DESCRIBE = {
+    "id": "rclone_upload",
+    "name": "Rclone 上传 0.4.1",
+    "description": "通过 rclone 将视频上传至 PikPak 等云盘，自动按主播名分类存储",
+    "params": [
+        {
+            "key": "remote_name",
+            "label": "Rclone 远程名称",
+            "type": "string",
+            "default": "pikpak",
+        },
+        {
+            "key": "base_dir",
+            "label": "云盘目标目录",
+            "type": "string",
+            "default": "StripchatRecorder",
+        },
+        {
+            "key": "rclone_path",
+            "label": "rclone 路径",
+            "type": "string",
+            "default": "rclone",
+        },
+        {
+            "key": "max_retries",
+            "label": "最大重试次数",
+            "type": "number",
+            "default": 3,
+        },
+        {
+            "key": "delete_after_upload",
+            "label": "上传成功后删除本地文件",
+            "type": "boolean",
+            "default": False,
+        },
+        {
+            "key": "transfers",
+            "label": "并行传输数",
+            "type": "number",
+            "default": 2,
+        },
+    ],
+    "i18n": {
+        "en-US": {
+            "name": "Rclone Upload 0.4.1",
+            "description": "Upload videos to cloud storage via rclone, auto-categorized by streamer name",
+            "params": {
+                "remote_name": {"label": "Rclone Remote Name"},
+                "base_dir": {"label": "Cloud Target Directory"},
+                "rclone_path": {"label": "Rclone Path"},
+                "max_retries": {"label": "Max Retries"},
+                "delete_after_upload": {"label": "Delete local file after upload"},
+                "transfers": {"label": "Parallel Transfers"},
+            },
+        },
+    },
+}
+
+
+def parse_stem(stem: str):
+    """
+    从文件名（不含扩展名）中提取主播名和时间戳。
+    格式: {model_name}_{YYYYMMDD}_{HHMMSS}
+    """
+    parts = stem.split("_")
+    if len(parts) >= 3:
+        date_str = parts[-2]
+        time_str = parts[-1]
+        if (
+            len(date_str) == 8
+            and date_str.isdigit()
+            and len(time_str) == 6
+            and time_str.isdigit()
+        ):
+            model = "_".join(parts[:-2])
+            return model
+    return stem
+
+
+def emit_progress(done: int, total: int = PROGRESS_SCALE):
+    print(f"PROGRESS:{done}/{total}", flush=True)
+
+
+def emit_status(text: str):
+    print(f"STATUS:{text}", flush=True)
+
+
+def emit_output(path: str):
+    print(f"OUTPUT:{path}", flush=True)
+
+
+def param(key: str, default=""):
+    val = os.environ.get(f"PP_PARAM_{key.upper()}", "")
+    if val == "":
+        return default
+    return val
+
+
+def param_int(key: str, default: int) -> int:
+    try:
+        return int(param(key, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+
+def param_bool(key: str, default: bool) -> bool:
+    return param(key, str(default)).lower() in ("true", "1", "yes", "on")
+
+
+def format_file_size(size_bytes: int) -> str:
+    """将字节数格式化为人类可读的字符串"""
+    size = float(size_bytes)
+    for unit in ["B", "KiB", "MiB", "GiB", "TiB"]:
+        if size < 1024:
+            return f"{size:.2f} {unit}"
+        size /= 1024
+    return f"{size:.2f} PiB"
+
+
+def format_speed(bytes_per_sec: float) -> str:
+    """
+    格式化上传速度，与 SR Telegram 模块 pp_utils::format_speed 保持一致。
+    Format upload speed, matching SR Telegram module pp_utils::format_speed.
+    """
+    if bytes_per_sec >= 1024.0 * 1024.0:
+        return f"↑ {bytes_per_sec / (1024.0 * 1024.0):.1f} MB/s"
+    elif bytes_per_sec >= 1024.0:
+        return f"↑ {bytes_per_sec / 1024.0:.1f} KB/s"
+    else:
+        return f"↑ {bytes_per_sec:.0f} B/s"
+
+
+def parse_speed_to_bps(speed_str: str) -> float | None:
+    """
+    将 rclone 输出的速度字符串（如 "2.345 MiB/s"）转换为 bytes/sec。
+    Convert rclone speed string (e.g. "2.345 MiB/s") to bytes/sec.
+    """
+    m = re.match(
+        r"([\d.]+)\s*(KiB|MiB|GiB|TiB|KB|MB|GB|TB|B)/s",
+        speed_str.strip(),
+    )
+    if not m:
+        return None
+    val = float(m.group(1))
+    unit = m.group(2)
+    multipliers = {
+        "B": 1,
+        "KB": 1000, "MB": 1000000, "GB": 1000000000, "TB": 1000000000000,
+        "KiB": 1024, "MiB": 1024 * 1024, "GiB": 1024 * 1024 * 1024, "TiB": 1024 * 1024 * 1024 * 1024,
+    }
+    return val * multipliers.get(unit, 1)
+
+
+def ensure_remote_folder(rclone_path: str, remote: str, base_dir: str, folder_name: str):
+    """确保远程目录存在"""
+    remote_path = f"{remote}:{base_dir}/{folder_name}"
+    try:
+        result = subprocess.run(
+            [rclone_path, "mkdir", remote_path],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            sys.stderr.write(f"mkdir failed: {result.stderr}\n")
+            return False
+        return True
+    except Exception as e:
+        sys.stderr.write(f"mkdir exception: {e}\n")
+        return False
+
+
+_ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b[()][AB012]')
+
+
+def upload_file(
+    rclone_path: str,
+    local_path: str,
+    remote: str,
+    base_dir: str,
+    folder_name: str,
+    transfers: int,
+):
+    """
+    使用 rclone copyto 上传文件，实时解析进度。
+
+    核心修复（v0.4.0）：
+    1. 放弃 --progress（交互式模式，检测到非 TTY 时完全沉默）
+    2. 改用 --stats 1s -v（日志模式，不依赖 TTY，输出 \\n 分隔的统计行到 stderr）
+    3. 放弃 pty（Docker 容器中可能因 seccomp 限制不可用）
+    4. 用纯管道 stderr=subprocess.PIPE + select 非阻塞读取
+    5. STATUS 同时显示百分比和上传速度（如 "正在上传... 50% ↑ 3.200 MiB/s"）
+    """
+    remote_dest = f"{remote}:{base_dir}/{folder_name}/{os.path.basename(local_path)}"
+    file_size = os.path.getsize(local_path)
+
+    sys.stderr.write(
+        f"[rclone_upload] file={os.path.basename(local_path)} "
+        f"size={format_file_size(file_size)} dest={remote_dest}\n"
+    )
+
+    cmd = [
+        rclone_path,
+        "copyto",
+        local_path,
+        remote_dest,
+        "--stats", "1s",
+        "-v",
+        "--no-traverse",
+        "--retries", "3",
+        "--low-level-retries", "20",
+        "--timeout", "300s",
+    ]
+
+    sys.stderr.write(f"[rclone_upload] cmd: {' '.join(cmd)}\n")
+
+    # ── 启动 rclone（纯管道，不需要 pty）──
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+    except Exception as e:
+        return False, f"Failed to spawn rclone: {e}"
+
+    err_fd = proc.stderr.fileno()
+    stdout_fd = proc.stdout.fileno()
+
+    # ── 设置非阻塞读取 ──
+    for fd in (err_fd, stdout_fd):
+        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
+    last_progress = 0
+    stderr_lines = []
+    stderr_buffer = ""
+
+    def process_line(line: str):
+        """解析一行 rclone 输出，提取进度和速度"""
+        nonlocal last_progress
+
+        # 去除 ANSI 转义序列（终端颜色/光标移动等）
+        line = _ANSI_ESCAPE.sub('', line)
+        line = line.strip()
+        if not line:
+            return
+
+        stderr_lines.append(line)
+
+        # rclone -v --stats 1s 输出格式（日志模式，\n 分隔）:
+        #   Transferred:            1.771 GiB / 17.710 GiB, 10%, 2.345 MiB/s, ETA 1m23s   ← 字节行（有速度 /s）
+        #   Transferred:            0 / 1, 0%                                           ← 文件计数行（无速度）
+        #   Checks:                 0 / 0, 0%
+        #   Elapsed time:        10.0s
+        # 只从含 "Transferred" + "%" + "/s" 的字节行提取进度和速度
+        if "Transferred" in line and "%" in line and "/s" in line:
+            # ── 提取百分比 → PROGRESS（驱动进度条，SR 前端自己算百分比）──
+            pct_match = re.search(r"([\d.]+)\s*%", line)
+            if pct_match:
+                try:
+                    pct = float(pct_match.group(1))
+                    progress = int(pct * PROGRESS_SCALE / 100.0)
+                    if progress > last_progress:
+                        last_progress = progress
+                        emit_progress(progress)
+                except ValueError:
+                    pass
+
+            # ── 提取上传速度 → STATUS（只输出速度，不输出百分比）──
+            # 与 Telegram 模块保持一致：STATUS 只有速度，百分比由 PROGRESS 驱动
+            speed_match = re.search(
+                r"([\d.]+\s*(?:KiB|MiB|GiB|TiB|PiB|KB|MB|GB|TB|PB|B)/s)",
+                line,
+            )
+            if speed_match:
+                bps = parse_speed_to_bps(speed_match.group(1))
+                if bps is not None:
+                    emit_status(format_speed(bps))
+
+        if "ERROR" in line or "Failed" in line or "error" in line.lower():
+            sys.stderr.write(f"rclone: {line}\n")
+
+    # ── 主读取循环 ──
+    while True:
+        readable, _, _ = select.select([err_fd, stdout_fd], [], [], 1.0)
+
+        got_data = False
+
+        # 读取 stderr（rclone -v --stats 1s 的统计输出在 stderr）
+        if err_fd in readable:
+            try:
+                chunk = os.read(err_fd, 65536)
+                if chunk:
+                    got_data = True
+                    stderr_buffer += chunk.decode("utf-8", errors="replace")
+                    # 按 \n 分割成行（-v 日志模式用 \n 分隔）
+                    parts = re.split(r"[\r\n]+", stderr_buffer)
+                    stderr_buffer = parts[-1]  # 最后一段可能不完整，保留
+                    for part in parts[:-1]:
+                        process_line(part)
+            except BlockingIOError:
+                pass
+
+        # 排空 stdout（防止 stdout 缓冲区满导致 rclone 阻塞）
+        if stdout_fd in readable:
+            try:
+                chunk = os.read(stdout_fd, 65536)
+                if chunk:
+                    got_data = True
+                    text = chunk.decode("utf-8", errors="replace").strip()
+                    if text:
+                        sys.stderr.write(f"rclone stdout: {text}\n")
+            except (BlockingIOError, OSError):
+                pass
+
+        # 进程结束且无更多数据可读时退出
+        if proc.poll() is not None and not got_data:
+            if stderr_buffer.strip():
+                process_line(stderr_buffer)
+                stderr_buffer = ""
+            break
+
+    proc.wait()
+
+    if proc.returncode == 0:
+        emit_progress(PROGRESS_SCALE)
+        return True, "Upload OK"
+    else:
+        error_lines = [
+            l
+            for l in stderr_lines
+            if "ERROR" in l or "error" in l.lower() or "Failed" in l
+        ]
+        error_msg = (
+            "\n".join(error_lines)
+            if error_lines
+            else (
+                "\n".join(stderr_lines[-5:])
+                if stderr_lines
+                else f"rclone exit {proc.returncode}"
+            )
+        )
+        return False, error_msg
+
+
+def run():
+    input_str = os.environ.get("PP_INPUT", "")
+    if not input_str:
+        sys.stderr.write("PP_INPUT not set\n")
+        sys.exit(1)
+
+    input_path = os.path.abspath(input_str)
+    if not os.path.exists(input_path):
+        sys.stderr.write(f"Input file not found: {input_path}\n")
+        sys.exit(1)
+
+    remote_name = param("remote_name", "pikpak")
+    base_dir = param("base_dir", "StripchatRecorder")
+    rclone_path = param("rclone_path", "rclone")
+    max_retries = param_int("max_retries", 3)
+    delete_after = param_bool("delete_after_upload", False)
+    transfers = param_int("transfers", 2)
+
+    stem = os.path.splitext(os.path.basename(input_path))[0]
+    streamer_name = parse_stem(stem)
+    if not streamer_name:
+        streamer_name = "unknown"
+
+    file_size = os.path.getsize(input_path)
+
+    sys.stderr.write(
+        f"[rclone_upload] file={input_path}, streamer={streamer_name}, "
+        f"size={format_file_size(file_size)}, "
+        f"target={remote_name}:{base_dir}/{streamer_name}/\n"
+    )
+
+    emit_progress(0)
+    emit_status(f"准备上传 {format_file_size(file_size)} 至 {streamer_name}/")
+
+    ensure_remote_folder(rclone_path, remote_name, base_dir, streamer_name)
+
+    emit_status("正在上传...")
+
+    last_error = ""
+    for attempt in range(1, max_retries + 1):
+        sys.stderr.write(f"Upload attempt {attempt}/{max_retries}\n")
+
+        success, message = upload_file(
+            rclone_path, input_path, remote_name, base_dir, streamer_name, transfers
+        )
+
+        if success:
+            emit_status("上传完成 ✓")
+            if delete_after:
+                print("DELETE_INPUT", flush=True)
+            else:
+                emit_output(input_path)
+            sys.stderr.write(
+                f"Upload success: {input_path} -> "
+                f"{remote_name}:{base_dir}/{streamer_name}/\n"
+            )
+            return
+
+        last_error = message
+        if attempt < max_retries:
+            wait_time = 10 * attempt
+            emit_status(f"重试中 ({attempt}/{max_retries})，{wait_time}s 后重试...")
+            sys.stderr.write(
+                f"Upload failed (attempt {attempt}/{max_retries}): {message}\n"
+            )
+            time.sleep(wait_time)
+
+    emit_status("上传失败 ✗")
+    sys.stderr.write(f"Upload failed after {max_retries} attempts: {last_error}\n")
+    emit_output(input_path)
+    sys.exit(1)
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] == "--describe":
+        print(json.dumps(DESCRIBE, ensure_ascii=False, indent=2))
+        return
+
+    try:
+        run()
+    except Exception as e:
+        sys.stderr.write(f"Rclone module error: {e}\n")
+        input_str = os.environ.get("PP_INPUT", "")
+        if input_str:
+            emit_output(input_str)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

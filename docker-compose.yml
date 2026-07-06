@@ -1,0 +1,23 @@
+services:
+  s-recorder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: s-recorder:latest
+    container_name: s-recorder
+    restart: unless-stopped
+    ports:
+      - "24136:24136"
+    volumes:
+      - ./data/config:/app/s-recorder/config
+      - ./data/recordings:/app/s-recorder/recordings
+      - ./modules:/app/s-recorder/modules
+    environment:
+      - SRECORDER_DATA_DIR=/app/s-recorder
+      - PORT=24136
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:24136/api/settings"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10s
+      retries: 3

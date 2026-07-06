@@ -1,0 +1,27 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.venv
+venv
+
+# Node.js
+node_modules
+dist
+
+# IDE
+.vscode
+.idea
+
+# Data and logs
+data
+*.log
+
+# Documentation build artifacts
+docs
+*.md
